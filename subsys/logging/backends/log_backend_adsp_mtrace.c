@@ -10,6 +10,8 @@
 #include <zephyr/logging/log_output.h>
 #include <zephyr/logging/log_backend_std.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <string.h>
 #include <soc.h>
 
 #include <adsp_memory.h>
@@ -175,10 +177,281 @@ out:
 }
 
 #if CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE
-static uint8_t cache_buf[CONFIG_MTRACE_LOG_CACHE_BUF_SIZE];
-static size_t cache_buf_head;
-static size_t cache_buf_len;
+/*
+ * The cache buffer absorbs bursts the debug window slot cannot take because
+ * the host has not consumed it yet. Data moves from the cache into the slot
+ * only once the host has made room, which it does independently of DSP log
+ * activity. Draining solely from char_out() would leave the tail of a burst in
+ * the cache forever, hence the periodic drain below.
+ */
+#ifdef CONFIG_LOG_MULTI_SLOT
+#define MTRACE_CACHE_COUNT	CONFIG_MP_MAX_NUM_CPUS
+#else
+#define MTRACE_CACHE_COUNT	1
 #endif
+
+struct mtrace_cache {
+	struct k_spinlock lock;
+	size_t head;
+	size_t len;
+	uint32_t dropped_bytes;
+	bool discarding;
+	uint8_t buf[CONFIG_MTRACE_LOG_CACHE_BUF_SIZE];
+};
+
+static struct mtrace_cache mtrace_caches[MTRACE_CACHE_COUNT];
+static bool mtrace_drain_armed;
+
+static void mtrace_drain_handler(struct k_work *work);
+
+static K_WORK_DELAYABLE_DEFINE(mtrace_drain_work, mtrace_drain_handler);
+
+static struct mtrace_cache *mtrace_cache_get(unsigned int core)
+{
+	if (core >= MTRACE_CACHE_COUNT) {
+		core = 0;
+	}
+
+	return &mtrace_caches[core];
+}
+
+static void mtrace_cache_append(struct mtrace_cache *cache, const uint8_t *src,
+				size_t len)
+{
+	size_t w = (cache->head + cache->len) % CONFIG_MTRACE_LOG_CACHE_BUF_SIZE;
+	size_t first = MIN(len, CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - w);
+
+	memcpy(&cache->buf[w], src, first);
+
+	if (first < len) {
+		memcpy(&cache->buf[0], src + first, len - first);
+	}
+
+	cache->len += len;
+}
+
+/*
+ * Runs with the cache lock held. Drops a trailing partial line so that the
+ * cache only ever holds whole lines. The output function is called with chunks
+ * that follow the log_output buffer boundaries, so a line longer than that
+ * buffer arrives in several pieces and a piece may be left dangling when the
+ * rest of the line has to be dropped.
+ */
+static void mtrace_cache_trim_partial(struct mtrace_cache *cache)
+{
+	while (cache->len > 0) {
+		size_t idx = (cache->head + cache->len - 1) %
+			     CONFIG_MTRACE_LOG_CACHE_BUF_SIZE;
+
+		if (cache->buf[idx] == '\n') {
+			return;
+		}
+
+		cache->len--;
+		cache->dropped_bytes++;
+	}
+}
+
+/*
+ * Runs with the cache lock held. A partial log line is never left in the cache:
+ * when the remaining room cannot hold a whole line, the rest of that line is
+ * dropped and the next line boundary is used to resynchronise. The number of
+ * dropped bytes is accumulated so it can be reported later.
+ */
+static void mtrace_cache_fill(struct mtrace_cache *cache, const uint8_t *data,
+			      size_t length)
+{
+	size_t offset = 0;
+
+	if (cache->discarding) {
+		const uint8_t *nl = memchr(data, '\n', length);
+
+		if (nl == NULL) {
+			cache->dropped_bytes += (uint32_t)length;
+			return;
+		}
+
+		offset = (size_t)(nl - data) + 1;
+		cache->dropped_bytes += (uint32_t)offset;
+		cache->discarding = false;
+	}
+
+	while (offset < length) {
+		size_t room = CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - cache->len;
+		size_t remain = length - offset;
+		const uint8_t *nl;
+		size_t keep = 0;
+
+		if (remain <= room) {
+			mtrace_cache_append(cache, data + offset, remain);
+			break;
+		}
+
+		/* Keep the longest prefix ending on a line boundary that fits. */
+		for (size_t i = room; i > 0; i--) {
+			if (data[offset + i - 1] == '\n') {
+				keep = i;
+				break;
+			}
+		}
+
+		if (keep > 0) {
+			mtrace_cache_append(cache, data + offset, keep);
+			offset += keep;
+			continue;
+		}
+
+		/*
+		 * No whole line fits: drop the remainder of this line rather than
+		 * leaving a truncated one behind, then resynchronise.
+		 */
+		mtrace_cache_trim_partial(cache);
+
+		nl = memchr(data + offset, '\n', remain);
+
+		if (nl == NULL) {
+			cache->dropped_bytes += (uint32_t)remain;
+			cache->discarding = true;
+			break;
+		}
+
+		keep = (size_t)(nl - (data + offset)) + 1;
+		cache->dropped_bytes += (uint32_t)keep;
+		offset += keep;
+	}
+}
+
+/* Last byte held by the cache, or '\n' when the cache is empty. */
+static uint8_t mtrace_cache_tail(struct mtrace_cache *cache)
+{
+	size_t idx;
+
+	if (cache->len == 0) {
+		return '\n';
+	}
+
+	idx = (cache->head + cache->len - 1) % CONFIG_MTRACE_LOG_CACHE_BUF_SIZE;
+
+	return cache->buf[idx];
+}
+
+/* Runs with the cache lock held. Emits a notice for previously dropped data. */
+static void mtrace_cache_notice(struct mtrace_cache *cache)
+{
+	char msg[64];
+	size_t room;
+	int len;
+
+	if (cache->dropped_bytes == 0) {
+		return;
+	}
+
+	/* Only ever start on a line boundary. */
+	if (mtrace_cache_tail(cache) != '\n') {
+		return;
+	}
+
+	len = snprintk(msg, sizeof(msg), "--- %u bytes dropped ---\r\n",
+		       cache->dropped_bytes);
+	if (len <= 0) {
+		return;
+	}
+
+	room = (size_t)CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - cache->len;
+	if ((size_t)len > room) {
+		/* No room yet, retry once the host has consumed the cache. */
+		return;
+	}
+
+	mtrace_cache_append(cache, (const uint8_t *)msg, (size_t)len);
+	cache->dropped_bytes = 0;
+}
+
+/* Runs with the cache lock held. Moves cached data into the slot. */
+static size_t mtrace_cache_drain(struct mtrace_cache *cache, unsigned int core,
+				 size_t *space_left)
+{
+	size_t chunk;
+	size_t out;
+
+	if (cache->len == 0) {
+		/*
+		 * Nothing to move, but the caller still needs the real free space
+		 * of the slot for the notification watermark. A zero length write
+		 * only reports the free space and stores nothing.
+		 */
+		(void)mtrace_out(NULL, 0, space_left, core);
+		return 0;
+	}
+
+	chunk = MIN(cache->len, CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - cache->head);
+
+	out = mtrace_out((int8_t *)cache->buf + cache->head, chunk, space_left, core);
+
+	if (*space_left > 0 && cache->len > chunk) {
+		out += mtrace_out((int8_t *)cache->buf,
+				  MIN(*space_left, cache->len - chunk), space_left,
+				  core);
+	}
+
+	cache->head = (cache->head + out) % CONFIG_MTRACE_LOG_CACHE_BUF_SIZE;
+	cache->len -= out;
+
+	return out;
+}
+
+static void mtrace_drain_schedule(void)
+{
+	if (!mtrace_drain_armed || k_is_pre_kernel()) {
+		return;
+	}
+
+	(void)k_work_reschedule(&mtrace_drain_work,
+				K_MSEC(CONFIG_MTRACE_LOG_CACHE_DRAIN_PERIOD_MS));
+}
+
+/*
+ * Moves whatever the caches hold into the slots. Called both from the periodic
+ * work and synchronously from the panic path, which must not reschedule work.
+ */
+static void mtrace_drain(bool schedule)
+{
+	for (unsigned int core = 0; core < MTRACE_CACHE_COUNT; core++) {
+		struct mtrace_cache *cache = &mtrace_caches[core];
+		k_spinlock_key_t key;
+		size_t space_left = 0;
+		size_t written;
+		bool pending;
+
+		key = k_spin_lock(&cache->lock);
+		written = mtrace_cache_drain(cache, core, &space_left);
+
+		/* Report earlier losses as soon as the cache has room for it. */
+		if (cache->dropped_bytes > 0) {
+			mtrace_cache_notice(cache);
+			written += mtrace_cache_drain(cache, core, &space_left);
+		}
+
+		pending = (cache->len > 0);
+		k_spin_unlock(&cache->lock, key);
+
+		if (written > 0 && mtrace_hook != NULL) {
+			mtrace_hook(written, space_left);
+		}
+
+		if (pending && schedule) {
+			mtrace_drain_schedule();
+		}
+	}
+}
+
+static void mtrace_drain_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	mtrace_drain(true);
+}
+#endif /* CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE */
 
 static int char_out(uint8_t *data, size_t length, void *ctx)
 {
@@ -195,29 +468,23 @@ static int char_out(uint8_t *data, size_t length, void *ctx)
 	 * active. this ensures we can capture early boot messages.
 	 */
 #if CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE
-	size_t bytes_copy = MIN(CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - cache_buf_len, length);
-	size_t bytes_write = 0;
-	size_t r_pos = cache_buf_head;
-	size_t w_pos = (cache_buf_head + cache_buf_len) % CONFIG_MTRACE_LOG_CACHE_BUF_SIZE;
+	struct mtrace_cache *cache = mtrace_cache_get(core);
+	k_spinlock_key_t key = k_spin_lock(&cache->lock);
+	bool pending;
 
-	memcpy(cache_buf + w_pos, data,
-	       MIN(bytes_copy, CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - w_pos));
-	if (bytes_copy > CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - w_pos) {
-		memcpy(cache_buf, data + (CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - w_pos),
-		       bytes_copy - (CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - w_pos));
+	/* Report earlier losses before the data that follows them. */
+	mtrace_cache_notice(cache);
+
+	mtrace_cache_fill(cache, data, length);
+
+	out = mtrace_cache_drain(cache, core, &space_left);
+	pending = (cache->len > 0);
+
+	k_spin_unlock(&cache->lock, key);
+
+	if (pending) {
+		mtrace_drain_schedule();
 	}
-	cache_buf_len += bytes_copy;
-
-	bytes_write = MIN(cache_buf_len, CONFIG_MTRACE_LOG_CACHE_BUF_SIZE - r_pos);
-	out = mtrace_out(cache_buf + r_pos, bytes_write, &space_left, core);
-	if (space_left > 0 && cache_buf_len > bytes_write) {
-		out += mtrace_out(cache_buf,
-				  MIN(space_left, cache_buf_len - bytes_write),
-				  &space_left, core);
-	}
-
-	cache_buf_head = (cache_buf_head + out) % CONFIG_MTRACE_LOG_CACHE_BUF_SIZE;
-	cache_buf_len -= out;
 #else
 	out = mtrace_out(data, length, &space_left, core);
 #endif
@@ -269,6 +536,11 @@ static uint32_t format_flags(void)
 static void panic(struct log_backend const *const backend)
 {
 	mtrace_panic_mode = true;
+
+#if CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE
+	/* Push whatever is cached to the slot while the host can still read it. */
+	mtrace_drain(false);
+#endif
 }
 
 static void dropped(const struct log_backend *const backend,
@@ -308,6 +580,13 @@ static void init(const struct log_backend *const backend)
 	ARG_UNUSED(backend);
 
 	mtrace_init();
+
+#if CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE
+	/* The drain work is statically defined; only enable scheduling now that
+	 * the kernel is up and the slot is known.
+	 */
+	mtrace_drain_armed = true;
+#endif
 }
 
 const struct log_backend_api log_backend_adsp_mtrace_api = {
@@ -323,6 +602,16 @@ LOG_BACKEND_DEFINE(log_backend_adsp_mtrace, log_backend_adsp_mtrace_api, true);
 void adsp_mtrace_log_init(adsp_mtrace_log_hook_t hook)
 {
 	mtrace_init();
+
+#if CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE
+	if (hook == NULL) {
+		/* Nothing will drain the cache once the host stops reading it. */
+		mtrace_drain_armed = false;
+		(void)k_work_cancel_delayable(&mtrace_drain_work);
+	} else {
+		mtrace_drain_armed = true;
+	}
+#endif
 
 	mtrace_hook = hook;
 	mtrace_active = !!hook;

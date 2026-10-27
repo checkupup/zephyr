@@ -34,3 +34,20 @@ config MTRACE_LOG_CACHE_BUF_SIZE
 	range 0 32768
 	help
 	  Number of bytes dedicated for the mtrace log cache buffer.
+
+	  Only used when the value is larger than the debug window slot size,
+	  otherwise log data is written to the slot directly.
+
+config MTRACE_LOG_CACHE_DRAIN_PERIOD_MS
+	int "mtrace log cache buffer drain period"
+	depends on LOG_BACKEND_ADSP_MTRACE
+	default 1
+	range 1 10
+	help
+	  Period, in milliseconds, at which the mtrace backend retries moving
+	  data from its internal cache buffer into the debug window slot.
+	  The slot has room again only after the host has consumed it, which
+	  happens independently of the DSP log activity. Without a periodic
+	  drain the cached data would only be pushed when new log output
+	  arrives, so the tail of a burst would stay in the cache indefinitely
+	  and never reach the host.

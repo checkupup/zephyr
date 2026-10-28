@@ -200,6 +200,25 @@ struct mtrace_cache {
 };
 
 static struct mtrace_cache mtrace_caches[MTRACE_CACHE_COUNT];
+
+/*
+ * Consecutive periodic drain rounds that moved nothing while data was pending.
+ * A host can stop consuming the slot at any time; retrying at the configured
+ * period forever would keep a core awake for nothing, so the period backs off
+ * from this counter. Any drain that moves data resets it. Read and written from
+ * the drain work and from char_out(), hence atomic.
+ */
+static atomic_t mtrace_drain_stalled;
+
+#define MTRACE_DRAIN_STALL_ROUNDS	8U
+#define MTRACE_DRAIN_BACKOFF_MAX_MS	1000U
+/*
+ * The period doubles once per MTRACE_DRAIN_STALL_ROUNDS stalled rounds and is
+ * capped at MTRACE_DRAIN_BACKOFF_MAX_MS, so this many rounds already sits at the
+ * cap; the counter saturates there instead of growing without bound.
+ */
+#define MTRACE_DRAIN_STALL_MAX		(MTRACE_DRAIN_STALL_ROUNDS * 10U)
+
 static bool mtrace_drain_armed;
 
 static void mtrace_drain_handler(struct k_work *work);
@@ -400,28 +419,78 @@ static size_t mtrace_cache_drain(struct mtrace_cache *cache, unsigned int core,
 	return out;
 }
 
+/*
+ * Next retry delay. The configured period is used while the host keeps making
+ * room, and doubled for every MTRACE_DRAIN_STALL_ROUNDS consecutive rounds
+ * that moved nothing, up to MTRACE_DRAIN_BACKOFF_MAX_MS. The retries never stop
+ * entirely, so data still reaches the host once it starts reading again.
+ */
+static k_timeout_t mtrace_drain_delay(void)
+{
+	unsigned int period = CONFIG_MTRACE_LOG_CACHE_DRAIN_PERIOD_MS;
+	unsigned int shift = (unsigned int)atomic_get(&mtrace_drain_stalled) /
+			     MTRACE_DRAIN_STALL_ROUNDS;
+
+	while (shift > 0U) {
+		period = MIN(period * 2U, MTRACE_DRAIN_BACKOFF_MAX_MS);
+		shift--;
+	}
+
+	return K_MSEC(period);
+}
+
 static void mtrace_drain_schedule(void)
 {
 	if (!mtrace_drain_armed || k_is_pre_kernel()) {
 		return;
 	}
 
-	(void)k_work_reschedule(&mtrace_drain_work,
-				K_MSEC(CONFIG_MTRACE_LOG_CACHE_DRAIN_PERIOD_MS));
+	if (atomic_get(&mtrace_drain_stalled) == 0) {
+		/* Draining: keep the retry at the configured period. */
+		(void)k_work_reschedule(&mtrace_drain_work,
+					K_MSEC(CONFIG_MTRACE_LOG_CACHE_DRAIN_PERIOD_MS));
+	} else {
+		/*
+		 * Stalled: leave a pending retry on its backed off deadline.
+		 * Rescheduling here would let a steady stream of log writes
+		 * postpone the retry indefinitely.
+		 */
+		(void)k_work_schedule(&mtrace_drain_work, mtrace_drain_delay());
+	}
 }
 
 /*
- * Moves whatever the caches hold into the slots. Called both from the periodic
- * work and synchronously from the panic path, which must not reschedule work.
+ * Feeds one drain round into the backoff counter: a round that moved data
+ * clears it, a round that could not move pending data counts towards the next
+ * backoff step. Counting rounds rather than bytes means an empty cache is not a
+ * stall, and the counter is backend wide, so a core starved of slot space while
+ * another one makes progress does not back off.
  */
-static void mtrace_drain(bool schedule)
+static void mtrace_drain_account(size_t moved, bool pending)
 {
+	if (moved > 0) {
+		atomic_set(&mtrace_drain_stalled, 0);
+	} else if (pending && ((unsigned int)atomic_get(&mtrace_drain_stalled) <
+			       MTRACE_DRAIN_STALL_MAX)) {
+		atomic_inc(&mtrace_drain_stalled);
+	}
+}
+
+/*
+ * Moves whatever the caches hold into the slots. Scheduling is left to the
+ * caller, because the panic path must not reschedule work. Returns true while
+ * data is still cached.
+ */
+static bool mtrace_drain(void)
+{
+	size_t moved = 0;
+	bool pending = false;
+
 	for (unsigned int core = 0; core < MTRACE_CACHE_COUNT; core++) {
 		struct mtrace_cache *cache = &mtrace_caches[core];
 		k_spinlock_key_t key;
 		size_t space_left = 0;
 		size_t written;
-		bool pending;
 
 		key = k_spin_lock(&cache->lock);
 		written = mtrace_cache_drain(cache, core, &space_left);
@@ -432,24 +501,31 @@ static void mtrace_drain(bool schedule)
 			written += mtrace_cache_drain(cache, core, &space_left);
 		}
 
-		pending = (cache->len > 0);
+		if (cache->len > 0) {
+			pending = true;
+		}
+
 		k_spin_unlock(&cache->lock, key);
 
 		if (written > 0 && mtrace_hook != NULL) {
 			mtrace_hook(written, space_left);
 		}
 
-		if (pending && schedule) {
-			mtrace_drain_schedule();
-		}
+		moved += written;
 	}
+
+	mtrace_drain_account(moved, pending);
+
+	return pending;
 }
 
 static void mtrace_drain_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	mtrace_drain(true);
+	if (mtrace_drain()) {
+		mtrace_drain_schedule();
+	}
 }
 #endif /* CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE */
 
@@ -481,6 +557,12 @@ static int char_out(uint8_t *data, size_t length, void *ctx)
 	pending = (cache->len > 0);
 
 	k_spin_unlock(&cache->lock, key);
+
+	/*
+	 * This write moved data, so the periodic drain no longer needs to back
+	 * off; rearm it at the configured period.
+	 */
+	mtrace_drain_account(out, pending);
 
 	if (pending) {
 		mtrace_drain_schedule();
@@ -539,7 +621,7 @@ static void panic(struct log_backend const *const backend)
 
 #if CONFIG_MTRACE_LOG_CACHE_BUF_SIZE > ADSP_DW_SLOT_SIZE
 	/* Push whatever is cached to the slot while the host can still read it. */
-	mtrace_drain(false);
+	(void)mtrace_drain();
 #endif
 }
 
@@ -609,6 +691,8 @@ void adsp_mtrace_log_init(adsp_mtrace_log_hook_t hook)
 		mtrace_drain_armed = false;
 		(void)k_work_cancel_delayable(&mtrace_drain_work);
 	} else {
+		/* A new host may read the slot again, so restart at the period. */
+		atomic_set(&mtrace_drain_stalled, 0);
 		mtrace_drain_armed = true;
 	}
 #endif

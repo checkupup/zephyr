@@ -51,3 +51,11 @@ config MTRACE_LOG_CACHE_DRAIN_PERIOD_MS
 	  drain the cached data would only be pushed when new log output
 	  arrives, so the tail of a burst would stay in the cache indefinitely
 	  and never reach the host.
+
+	  The retries back off while they make no progress, up to 1 second
+	  between attempts, and return to this period as soon as data moves
+	  again. This keeps a core from spinning when the host stops reading
+	  the slot.
+
+	  Only used when the cache buffer is enabled, that is when
+	  MTRACE_LOG_CACHE_BUF_SIZE is larger than the debug window slot size.
